@@ -1,0 +1,14 @@
+Metadata-Version: 1.1
+Name: sdas
+Version: 1.0
+Summary: Simple library to access ISTTOK database
+Home-page: http://metis.ipfn.ist.utl.pt/CODAC/IPFN_Software/SDAS
+Author: Bernardo Brotas
+Author-email: bernardo@ipfn.tecnico.ulisboa.pt
+License: LGPL
+Description: UNKNOWN
+Platform: UNKNOWN
+Requires: numpy
+Requires: socket
+Requires: scipy
+Requires: xmlrpclib

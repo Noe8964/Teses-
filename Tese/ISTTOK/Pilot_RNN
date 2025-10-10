@@ -1,0 +1,140 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset, random_split
+import numpy as np
+import matplotlib.pyplot as plt
+import json
+from fetch_and_plot import get_latest_pulse_file, load_data_from_file
+
+
+# ========================
+# 1. Load your pulse data
+# ========================
+with open("pulse_52657.json", "r") as f:
+    data = json.load(f)
+
+# Extract signals
+time = np.array(data["signals"]["Plasma Current"]["time"], dtype=np.float32)
+plasma_current = np.array(data["signals"]["Plasma Current"]["values"], dtype=np.float32)
+rogowski_current = np.array(data["signals"]["Rogowski Plasma Current"]["values"], dtype=np.float32)
+
+# Create square wave target
+threshold = 500
+square_wave = np.where(plasma_current > threshold, 1,
+                       np.where(plasma_current < -threshold, -1, 0))
+
+# Delay target by 100 samples
+delay = 100
+square_wave_delayed = np.zeros_like(square_wave)
+square_wave_delayed[delay:] = square_wave[:-delay]
+
+# ========================
+# 2. Build dataset (timesteps)
+# ========================
+timesteps = 20  # length of input sequence
+
+def create_sequences(signal1, signal2, target, timesteps):
+    X1, X2, y = [], [], []
+    for i in range(len(target) - timesteps):
+        X1.append(signal1[i:i+timesteps])
+        X2.append(signal2[i:i+timesteps])
+        y.append(target[i+timesteps])
+    return np.array(X1), np.array(X2), np.array(y)
+
+X1, X2, y = create_sequences(plasma_current, rogowski_current, square_wave_delayed, timesteps)
+
+# Reshape for LSTM [samples, timesteps, features]
+X1 = X1.reshape(X1.shape[0], timesteps, 1).astype(np.float32)
+X2 = X2.reshape(X2.shape[0], timesteps, 1).astype(np.float32)
+y = y.reshape(-1, 1).astype(np.float32)
+
+# Convert to tensors
+X1 = torch.tensor(X1)
+X2 = torch.tensor(X2)
+y = torch.tensor(y)
+
+dataset = TensorDataset(X1, X2, y)
+train_size = int(0.8 * len(dataset))
+val_size = len(dataset) - train_size
+train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+# ========================
+# 3. Define 2-input LSTM
+# ========================
+class TwoInputLSTM(nn.Module):
+    def __init__(self, hidden_size1=64, hidden_size2=32):
+        super(TwoInputLSTM, self).__init__()
+        self.lstm1 = nn.LSTM(1, hidden_size1, batch_first=True)  # Plasma
+        self.lstm2 = nn.LSTM(1, hidden_size2, batch_first=True)  # Rogowski
+        self.fc1 = nn.Linear(hidden_size1 + hidden_size2, 32)
+        self.fc2 = nn.Linear(32, 3)  # 3 classes: -1, 0, +1
+
+    def forward(self, x1, x2):
+        _, (h1, _) = self.lstm1(x1)
+        _, (h2, _) = self.lstm2(x2)
+        h1 = h1[-1]
+        h2 = h2[-1]
+        merged = torch.cat([h1, h2], dim=1)
+        x = torch.relu(self.fc1(merged))
+        out = self.fc2(x)  # logits
+        return out
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = TwoInputLSTM().to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# Convert target to categorical labels {0,1,2} instead of {-1,0,1}
+y_labels = (y.numpy() + 1).astype(int)  # -1->0, 0->1, +1->2
+dataset = TensorDataset(X1, X2, torch.tensor(y_labels))
+train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+# ========================
+# 4. Train model
+# ========================
+epochs = 20
+for epoch in range(epochs):
+    model.train()
+    train_loss = 0
+    for batch_X1, batch_X2, batch_y in train_loader:
+        batch_X1, batch_X2, batch_y = batch_X1.to(device), batch_X2.to(device), batch_y.to(device)
+        optimizer.zero_grad()
+        outputs = model(batch_X1, batch_X2)
+        loss = criterion(outputs, batch_y)
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item()
+
+    val_loss = 0
+    model.eval()
+    with torch.no_grad():
+        for batch_X1, batch_X2, batch_y in val_loader:
+            batch_X1, batch_X2, batch_y = batch_X1.to(device), batch_X2.to(device), batch_y.to(device)
+            outputs = model(batch_X1, batch_X2)
+            loss = criterion(outputs, batch_y)
+            val_loss += loss.item()
+
+    print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss/len(train_loader):.4f}, Val Loss: {val_loss/len(val_loader):.4f}")
+
+# ========================
+# 5. Evaluate on validation set
+# ========================
+model.eval()
+X1_val, X2_val, y_val = next(iter(val_loader))
+X1_val, X2_val = X1_val.to(device), X2_val.to(device)
+with torch.no_grad():
+    preds = model(X1_val, X2_val)
+    preds = torch.argmax(preds, dim=1).cpu().numpy()
+
+y_val = y_val.numpy()
+plt.plot(y_val[:200], label="True")
+plt.plot(preds[:200], label="Predicted")
+plt.legend()
+plt.title("Square wave prediction with delay")
+plt.show()

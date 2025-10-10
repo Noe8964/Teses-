@@ -1,0 +1,57 @@
+{
+    "pulse_id": "52657",
+    "signals": {
+        "Mirnov coil no. 1": {
+            "time": [],
+            "values": []
+        },
+        "Mirnov coil no. 2": {
+            "time": [],
+            "values": []
+        },
+        "Mirnov coil no. 3": {
+            "time": [],
+            "values": []
+        },
+        "Mirnov coil no. 4": {
+            "time": [],
+            "values": []
+        },
+        "Mirnov coil no. 5": {
+            "time": [],
+            "values": []
+        },
+        "Mirnov coil no. 6": {
+            "time": [],
+            "values": []
+        },
+        "Mirnov coil no. 7": {
+            "time": [],
+            "values": []
+        },
+        "Mirnov coil no. 8": {
+            "time": [],
+            "values": []
+        },
+        "Mirnov coil no. 9": {
+            "time": [],
+            "values": []
+        },
+        "Mirnov coil no. 10": {
+            "time": [],
+            "values": []
+        },
+        "Mirnov coil no. 11": {
+            "time": [],
+            "values": []
+        },
+        "Mirnov coil no. 12": {
+            "time": [],
+            "values": []
+        },
+        "Rogowski Plasma Current": {
+            "time": [],
+            "values": []
+        }
+    }
+}

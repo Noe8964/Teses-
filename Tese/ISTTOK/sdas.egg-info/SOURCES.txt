@@ -1,0 +1,16 @@
+setup.py
+sdas/__init__.py
+sdas.egg-info/PKG-INFO
+sdas.egg-info/SOURCES.txt
+sdas.egg-info/dependency_links.txt
+sdas.egg-info/top_level.txt
+sdas/core/SDAStime.py
+sdas/core/__init__.py
+sdas/core/client/SDASClient.py
+sdas/core/client/__init__.py
+sdas/core/common/ISDASProtocol.py
+sdas/core/common/__init__.py
+sdas/tests/LoadSdasData.py
+sdas/tests/StartSdas.py
+sdas/tests/__init__.py
+sdas/tests/testSDASwx.py

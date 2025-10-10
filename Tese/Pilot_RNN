@@ -1,0 +1,384 @@
+import os
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset, random_split
+import matplotlib.pyplot as plt
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+# ========================
+# 1. Config
+# ========================
+DATA_FOLDER = r"D:\Tese\ISTTOK\Saved_data"
+WINDOW = 100   # number of timesteps per sample
+DELAY = 100    # delay applied to target
+BATCH_SIZE = 32
+EPOCHS = 20
+THRESHOLD = 500
+LR = 0.001
+
+CURRENT_SIGNALS = {
+    "Plasma Current": "MARTE_NODE_IVO3.DataCollection.Channel_100",
+    "Rogowski Plasma Current": "MARTE_NODE_IVO3.DataCollection.Channel_088"
+}
+
+import numpy as np
+import os
+import json
+
+
+
+CURRENT_SIGNALS = {
+    "Plasma Current": "MARTE_NODE_IVO3.DataCollection.Channel_100",
+    "Rogowski Plasma Current": "MARTE_NODE_IVO3.DataCollection.Channel_088"
+}
+
+def get_all_pulse_files():
+    files = [f for f in os.listdir(DATA_FOLDER) if f.startswith("pulse_") and f.endswith(".json")]
+    sorted_files = sorted(files, key=lambda x: int(x.split("_")[1].split(".")[0]))
+    return [os.path.join(DATA_FOLDER, f) for f in sorted_files]
+
+def load_data_from_file(filepath):
+    with open(filepath, "r") as f:
+        return json.load(f)
+
+def three_state_square(signal, threshold=500):
+    square = np.zeros_like(signal)
+    square[signal > threshold] = 1
+    square[signal < -threshold] = -1
+    return square
+def normalize_signal(signal):
+    signal = np.array(signal, dtype=np.float32)
+    min_val = signal.min()
+    max_val = signal.max()
+    if max_val == min_val:
+        return np.zeros_like(signal)
+    return 2 * (signal - min_val) / (max_val - min_val) - 1
+
+
+
+
+def build_rnn_dataset(folder, window=50, delay=100, threshold=500):
+    
+    all_X1, all_X2, all_y = [], [], []
+    for filepath in get_all_pulse_files():
+        data = load_data_from_file(filepath)
+        signals = data["signals"]
+
+        # skip if signals missing
+        if not all(k in signals for k in CURRENT_SIGNALS):
+            continue
+
+        tcurrent1 = np.array(signals["Plasma Current"]["values"], dtype=np.float32)
+        tcurrent2 = np.array(signals["Rogowski Plasma Current"]["values"], dtype=np.float32)
+        # target square signal
+        square = three_state_square(tcurrent1, threshold)
+        # normalize inputs
+        current1 = normalize_signal(tcurrent1)       
+        current2 = normalize_signal(tcurrent2)
+        # delay applied to target
+        if len(square) <= delay:
+            continue
+        square = square[delay:]
+        current1 = current1[:-delay]
+        current2 = current2[:-delay]
+
+        X1_list, X2_list, y_list = [], [], []
+
+        # sliding windows
+        for i in range(len(square) - window):
+            X1_list.append(current1[i:i+window].reshape(window, 1))
+            X2_list.append(current2[i:i+window].reshape(window, 1))
+            y_list.append(square[i+window-1])
+
+        if len(X1_list) > 0:
+            # Convert lists → arrays for this pulse
+            X1_pulse = np.array(X1_list, dtype=np.float32)
+            X2_pulse = np.array(X2_list, dtype=np.float32)
+            y_pulse = np.array(y_list, dtype=np.int64) + 1  # map -1,0,1 → 0,1,2
+
+            all_X1.append(X1_pulse)
+            all_X2.append(X2_pulse)
+            all_y.append(y_pulse)
+
+    return all_X1, all_X2, all_y,tcurrent1, tcurrent2
+DATA_FOLDER = r"D:\Tese\ISTTOK\Saved_data"
+X1_list, X2_list, y_list,tcurrent1,tcurrent2 = build_rnn_dataset(DATA_FOLDER)
+print(f"Number of pulses: {len(X1_list)}")
+print(f"Pulse 0 shapes: X1={X1_list[0].shape}, X2={X2_list[0].shape}, y={y_list[0].shape}")
+print(f"Pulse 0 shapes: X1={X1_list[1].shape}, X2={X2_list[1].shape}, y={y_list[1].shape}")
+# Plot first 2 pulses only
+for pulse_idx in range(min(2, len(X1_list))):
+    X1 = X1_list[pulse_idx]
+    X2 = X2_list[pulse_idx]
+    y = y_list[pulse_idx] - 1  # map 0,1,2 → -1,0,1
+
+    # Extract first value of each window
+    X1_first = X1[:, 0, 0]
+    X2_first = X2[:, 0, 0]
+
+    plt.figure(figsize=(12,6))
+    plt.plot(tcurrent1, label="X1 (first value of each window)")
+    plt.plot(X2_first, label="X2 (first value of each window)")
+    plt.plot(y*1000, label="Target (square state)", alpha=0.8)
+    plt.title(f"Pulse {pulse_idx} - First Value of Each Window vs Target")
+    plt.xlabel("Sample Index")
+    plt.ylabel("Value / Square State")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    # ========================
+# RNN Model
+# ========================
+class DualInputRNN(nn.Module):
+    def __init__(self, input_size=1, hidden_size=64, num_layers=1, num_classes=3):
+        super(DualInputRNN, self).__init__()
+        
+        # Two separate RNNs for X1 and X2
+        self.rnn1 = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.rnn2 = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+
+        # Combine features from both
+        self.fc = nn.Linear(hidden_size*2, num_classes)
+
+    def forward(self, x1, x2):
+        # x1, x2: (batch, seq_len, 1)
+        _, (h1, _) = self.rnn1(x1)   # take last hidden state
+        _, (h2, _) = self.rnn2(x2)
+
+        h1 = h1[-1]  # (batch, hidden_size)
+        h2 = h2[-1]
+
+        h = torch.cat([h1, h2], dim=1)  # (batch, hidden_size*2)
+        out = self.fc(h)  # (batch, num_classes)
+        return out
+
+
+# ========================
+# Dataset Preparation
+# ========================
+def prepare_dataset(X1_list, X2_list, y_list, batch_size=32, train_split=0.8):
+    # Concatenate all pulses into one dataset
+    X1 = np.concatenate(X1_list, axis=0)
+    X2 = np.concatenate(X2_list, axis=0)
+    y  = np.concatenate(y_list, axis=0)
+    print(f"Total dataset shapes: X1={X1.shape}, X2={X2.shape}, y={y.shape}")\
+    # Convert to tensors
+    X1_tensor = torch.tensor(X1, dtype=torch.float32)
+    X2_tensor = torch.tensor(X2, dtype=torch.float32)
+    y_tensor  = torch.tensor(y, dtype=torch.long)
+
+    dataset = TensorDataset(X1_tensor, X2_tensor, y_tensor)
+
+    # Train/val split
+    train_size = int(train_split * len(dataset))
+    val_size   = len(dataset) - train_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    return train_loader, val_loader
+# ========================
+# Dataset class
+# ========================
+class PulseDataset(Dataset):
+    def __init__(self, X1, X2, y):
+        self.X1 = torch.tensor(X1, dtype=torch.float32)
+        self.X2 = torch.tensor(X2, dtype=torch.float32)
+        self.y  = torch.tensor(y, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X1[idx], self.X2[idx], self.y[idx]
+
+def split_by_pulses(X1_list, X2_list, y_list, train_ratio=0.8):
+    num_pulses = len(X1_list)
+    train_size = int(train_ratio * num_pulses)
+
+    # Shuffle pulse indices
+    indices = np.random.permutation(num_pulses)
+    train_idx, val_idx = indices[:train_size], indices[train_size:]
+
+    # Collect pulses into datasets
+    train_X1 = np.concatenate([X1_list[i] for i in train_idx], axis=0)
+    train_X2 = np.concatenate([X2_list[i] for i in train_idx], axis=0)
+    train_y  = np.concatenate([y_list[i]  for i in train_idx], axis=0)
+
+    val_X1   = np.concatenate([X1_list[i] for i in val_idx], axis=0)
+    val_X2   = np.concatenate([X2_list[i] for i in val_idx], axis=0)
+    val_y    = np.concatenate([y_list[i]  for i in val_idx], axis=0)
+
+    train_dataset = PulseDataset(train_X1, train_X2, train_y)
+    val_dataset   = PulseDataset(val_X1, val_X2, val_y)
+
+    return train_dataset, val_dataset
+
+# ========================
+# Model
+# ========================
+class JointRNN(nn.Module):
+    def __init__(self, input_size=2, hidden_size=64, num_layers=1, num_classes=3):
+        super().__init__()
+        self.rnn = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x1, x2):
+        # Concatenate along feature dim → shape (batch, seq_len, 2)
+        x = torch.cat([x1, x2], dim=2)
+        _, (h, _) = self.rnn(x)
+        h = h[-1]  # last hidden state
+        return self.fc(h)
+
+# ========================
+# Training
+# ========================
+def train_model(model, train_loader, val_loader, epochs=EPOCHS, lr=LR, device="cpu"):
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    train_losses, val_losses, train_accs, val_accs = [], [], [], []
+
+    model.to(device)
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss, train_correct = 0, 0
+
+        for X1, X2, y in train_loader:
+            X1, X2, y = X1.to(device), X2.to(device), y.to(device)
+            optimizer.zero_grad()
+            outputs = model(X1, X2)
+            loss = criterion(outputs, y)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item() * y.size(0)
+            train_correct += (outputs.argmax(1) == y).sum().item()
+
+        train_loss /= len(train_loader.dataset)
+        train_acc = train_correct / len(train_loader.dataset)
+
+        # Validation
+        model.eval()
+        val_loss, val_correct = 0, 0
+        with torch.no_grad():
+            for X1, X2, y in val_loader:
+                X1, X2, y = X1.to(device), X2.to(device), y.to(device)
+                outputs = model(X1, X2)
+                loss = criterion(outputs, y)
+                val_loss += loss.item() * y.size(0)
+                val_correct += (outputs.argmax(1) == y).sum().item()
+
+        val_loss /= len(val_loader.dataset)
+        val_acc = val_correct / len(val_loader.dataset)
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
+
+        print(f"Epoch [{epoch+1}/{epochs}] "
+              f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
+              f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
+
+    return train_losses, val_losses, train_accs, val_accs
+
+# ========================
+# Run
+# ========================
+X1_list, X2_list, y_list,tcurrent1,tcurrent2 = build_rnn_dataset(DATA_FOLDER)
+print(f"Number of pulses: {len(X1_list)}")
+
+train_dataset, val_dataset = split_by_pulses(X1_list, X2_list, y_list, train_ratio=0.8)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader   = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = DualInputRNN(input_size=1, hidden_size=64, num_layers=1, num_classes=3)
+
+train_losses, val_losses, train_accs, val_accs = train_model(model, train_loader, val_loader, device=device)
+
+# ========================
+# Plot
+# ========================
+plt.figure()
+plt.plot(train_losses, label="Train Loss")
+plt.plot(val_losses, label="Val Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.show()
+
+plt.figure()
+plt.plot(train_accs, label="Train Acc")
+plt.plot(val_accs, label="Val Acc")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.show()
+# ========================
+# Show predictions on validation set
+# ========================
+model.eval()
+all_preds, all_targets = [], []
+
+with torch.no_grad():
+    for X1, X2, y in val_loader:  # same val_loader you used in training
+        X1, X2 = X1.to(device), X2.to(device)
+        outputs = model(X1, X2)
+        preds = outputs.argmax(1).cpu().numpy()
+        targets = y.numpy()
+
+        all_preds.extend(preds)
+        all_targets.extend(targets)
+
+# Convert to numpy arrays
+all_preds = np.array(all_preds)
+all_targets = np.array(all_targets)
+
+# ========================
+# Plot
+# ========================
+plt.figure(figsize=(12,4))
+plt.plot(all_targets, label="True State")
+plt.plot(all_preds, label="Predicted State", alpha=0.7)
+plt.xlabel("Sample index (validation windows)")
+plt.ylabel("State (0,1,2)")
+plt.title("Validation Predictions vs Targets")
+plt.legend()
+plt.show()
+# ========================
+# Show predictions on training set
+# ========================
+
+all_preds_full = []
+all_targets_full = []
+
+for X1_pulse, X2_pulse, y_pulse in zip(X1_list, X2_list, y_list):
+    pulse_preds = []
+    pulse_targets = y_pulse  # already aligned with last timestep of windows
+
+    with torch.no_grad():
+        X1_tensor = torch.tensor(X1_pulse, dtype=torch.float32).to(device)
+        X2_tensor = torch.tensor(X2_pulse, dtype=torch.float32).to(device)
+        outputs = model(X1_tensor, X2_tensor)
+        pulse_preds = outputs.argmax(1).cpu().numpy()
+
+    all_preds_full.extend(pulse_preds)
+    all_targets_full.extend(pulse_targets)
+
+# Now plot
+plt.figure(figsize=(12,4))
+plt.plot(all_targets_full, label="True State")
+plt.plot(all_preds_full, label="Predicted State", alpha=0.7)
+plt.xlabel("Timestep index")
+plt.ylabel("State (0,1,2)")
+plt.title("Training Predictions vs Targets (pulse-aligned)")
+plt.legend()
+plt.show()
